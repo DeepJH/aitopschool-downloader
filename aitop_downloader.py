@@ -5,12 +5,17 @@
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
+import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +23,11 @@ import urllib.request
 BASE_URL = "https://ai.aitopschool.com"
 LOGIN_API = f"{BASE_URL}/wp-json/jwt-auth/v1/token"
 POST_VIDEOS_API = f"{BASE_URL}/wp-json/b2/v1/getPostVideos"
+CATEGORIES_API = f"{BASE_URL}/wp-json/wp/v2/categories"
+POSTS_API = f"{BASE_URL}/wp-json/wp/v2/posts"
+EXCLUDED_CATEGORY_SLUGS = {
+    "news", "zsnews", "hydt", "blog", "dating", "ukraine-1500", "gh", "paper"
+}
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -52,6 +62,19 @@ def get_default_download_dir() -> Path:
     user_home = Path.home()
     downloads = user_home / "Downloads"
     return downloads
+
+
+def display_width(s: str) -> int:
+    """计算字符串在终端中的显示宽度（中文字符占2列）"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1 for ch in s)
+
+
+def pad_string(s: str, target_width: int) -> str:
+    """用空格填充字符串至指定终端显示宽度"""
+    w = display_width(s)
+    if w < target_width:
+        return s + " " * (target_width - w)
+    return s
 
 
 def sanitize_filename(name: str) -> str:
@@ -97,6 +120,8 @@ class AitopClient:
 
     def get_token(self, force_refresh: bool = False) -> str:
         """获取或刷新 JWT 认证凭据"""
+        if not force_refresh and self.token:
+            return self.token
         if not force_refresh and self.token_cache_file.is_file():
             try:
                 with open(self.token_cache_file, "r", encoding="utf-8") as f:
@@ -200,13 +225,130 @@ class AitopClient:
 
         user_info = result.get("user") or {}
         allow = user_info.get("allow", False)
-        if not allow:
+        videos = result.get("videos") or []
+        has_playable = any(bool(v.get("url")) for v in videos)
+
+        # 表面显示无权但实际能下载时，也判定为有权
+        if not allow and not has_playable:
             role_info = user_info.get("role", {})
             raise PermissionError(
                 f"当前账号对页面 {post_id} 没有观看权限 (角色限制: {role_info})"
             )
 
         return result
+
+    def fetch_course_categories(self) -> list:
+        """获取站点所有包含文章的课程相关分类"""
+        categories = []
+        page = 1
+        while True:
+            url = f"{CATEGORIES_API}?per_page=100&page={page}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Referer": BASE_URL,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if not data:
+                        break
+                    categories.extend(data)
+                    total_pages = int(resp.headers.get("X-WP-TotalPages", 1))
+                    if page >= total_pages:
+                        break
+                    page += 1
+            except Exception:
+                break
+
+        course_cats = [
+            c for c in categories
+            if c.get("slug") not in EXCLUDED_CATEGORY_SLUGS and c.get("count", 0) > 0
+        ]
+        return sorted(course_cats, key=lambda x: x["id"])
+
+    def check_category_permission(self, category: dict) -> dict:
+        """
+        抽检分类下的第一篇课程，检查是否有权下载。
+        如果表面显示无权实际有权（能拿到视频直链），也判定为有权。
+        """
+        cat_id = category["id"]
+        url = f"{POSTS_API}?categories={cat_id}&per_page=1"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Referer": BASE_URL,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                posts = json.loads(resp.read().decode("utf-8"))
+            if not posts:
+                return {
+                    "category": category,
+                    "has_perm": False,
+                    "sample_post_id": None,
+                    "reason": "分类下无文章",
+                }
+            sample_post_id = posts[0]["id"]
+            sample_title = posts[0].get("title", {}).get("rendered", "")
+            try:
+                post_data = self.fetch_post_videos(str(sample_post_id))
+                videos = post_data.get("videos") or []
+                has_playable = any(bool(v.get("url")) for v in videos)
+                user_allow = post_data.get("user", {}).get("allow", False)
+                if user_allow or has_playable:
+                    reason = "正常有权" if user_allow else "表面受限但直链有效"
+                    return {
+                        "category": category,
+                        "has_perm": True,
+                        "sample_post_id": sample_post_id,
+                        "sample_post_title": sample_title,
+                        "video_count": len(videos),
+                        "reason": reason,
+                    }
+                else:
+                    return {
+                        "category": category,
+                        "has_perm": False,
+                        "sample_post_id": sample_post_id,
+                        "sample_post_title": sample_title,
+                        "video_count": len(videos),
+                        "reason": "无权观看 (视频链接为空)",
+                    }
+            except PermissionError as pe:
+                raw_msg = str(pe).split(": ")[-1] if ": " in str(pe) else str(pe)
+                clean_msg = re.sub(r'<[^>]+>', '', raw_msg).replace("['", "").replace("']", "").strip()
+                return {
+                    "category": category,
+                    "has_perm": False,
+                    "sample_post_id": sample_post_id,
+                    "sample_post_title": sample_title,
+                    "reason": f"需要: {clean_msg}" if clean_msg else "无权观看",
+                }
+        except Exception as e:
+            return {
+                "category": category,
+                "has_perm": False,
+                "sample_post_id": None,
+                "reason": f"请求异常: {e}",
+            }
+
+    def check_all_permissions(self, workers: int = 4) -> list:
+        """并发检测所有课程分类的下载权限"""
+        categories = self.fetch_course_categories()
+        self.get_token()
+        print(f"[*] 发现 {len(categories)} 个课程分类，正在以 {workers} 线程并发检测账号权限...")
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(self.check_category_permission, c) for c in categories]
+            for f in futures:
+                results.append(f.result())
+        results.sort(key=lambda x: x["category"]["id"])
+        return results
 
 
 def download_file(url: str, dest_path: Path, title: str):
@@ -325,12 +467,65 @@ def download_file(url: str, dest_path: Path, title: str):
         raise RuntimeError(f"下载中断: {dest_path.name}: {e}")
 
 
+def print_permission_table(results: list) -> list:
+    """打印期数/分类权限检测结果表格，并返回所有有权限的分类列表"""
+    allowed_list = []
+    print("\n" + "=" * 96)
+    header = (
+        pad_string("期数 / 分类名称", 32)
+        + pad_string("分类ID", 8)
+        + pad_string("课程数", 8)
+        + pad_string("抽检PostID", 12)
+        + pad_string("权限状态", 14)
+        + "备注"
+    )
+    print(header)
+    print("-" * 96)
+
+    for r in results:
+        cat = r["category"]
+        name = cat.get("name", "")
+        cid = str(cat.get("id", ""))
+        count = str(cat.get("count", 0))
+        sample_id = str(r.get("sample_post_id") or "-")
+        has_perm = r.get("has_perm", False)
+        status_str = "[√] 有权限" if has_perm else "[-] 无权限"
+        reason = r.get("reason", "")
+        if len(reason) > 30:
+            reason = reason[:27] + "..."
+
+        if has_perm:
+            allowed_list.append(cat)
+
+        line = (
+            pad_string(name, 32)
+            + pad_string(cid, 8)
+            + pad_string(count, 8)
+            + pad_string(sample_id, 12)
+            + pad_string(status_str, 14)
+            + reason
+        )
+        print(line)
+
+    print("-" * 96)
+    print(
+        f"检测完成: 共扫描 {len(results)} 个课程分类，其中 {len(allowed_list)} 个分类有权下载:"
+    )
+    for c in allowed_list:
+        print(f"  * {c.get('name')} (分类ID: {c.get('id')}, 共 {c.get('count')} 篇课程)")
+    print("=" * 96 + "\n")
+    return allowed_list
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="真术相成 (ai.aitopschool.com) 视频批量/单集下载工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 检测账号对所有期数/课程分类的下载权限:
+  python3 aitop_downloader.py --check-perms
+
   # 下载指定课程页面的全部视频到默认系统下载目录:
   python3 aitop_downloader.py https://ai.aitopschool.com/21667
 
@@ -344,7 +539,21 @@ def main():
 
     parser.add_argument(
         "url",
+        nargs="?",
+        default=None,
         help="课程播放页面的 URL 链接或课程 post_id (例如: https://ai.aitopschool.com/21667 或 21667)",
+    )
+    parser.add_argument(
+        "--check-perms",
+        action="store_true",
+        help="自动检测账号对各个期数/分类课程的下载权限并打印列表",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=8,
+        help="并发下载/检测线程数 (默认: 8)",
     )
     parser.add_argument(
         "-d",
@@ -372,14 +581,7 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. 解析目标课程 post_id
-    try:
-        post_id = parse_post_id(args.url)
-    except Exception as e:
-        print(f"[!] 错误: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # 2. 定位并读取 .env 配置
+    # 1. 定位并读取 .env 配置
     env_file = Path(args.env_file).resolve()
     if not env_file.is_file():
         script_env = Path(__file__).parent / ".env"
@@ -392,23 +594,41 @@ def main():
 
     if not username or not password:
         print(
-            f"[!] 错误: 未找到登录账号与密码！\n"
-            f"    请在当前目录的 .env 文件中配置:\n"
-            f"    AITOP_USERNAME=你的手机号\n"
-            f"    AITOP_PASSWORD=你的密码\n"
-            f"    (参考 .env.example 模板文件)",
+            "[!] 错误: 未找到登录账号与密码！\n"
+            "    请在当前目录的 .env 文件中配置:\n"
+            "    AITOP_USERNAME=你的手机号\n"
+            "    AITOP_PASSWORD=你的密码\n"
+            "    (参考 .env.example 模板文件)",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # 3. 初始化客户端并获取课程信息
+    # 2. 初始化客户端
     token_cache = Path(__file__).parent / ".aitop_token.json"
     client = AitopClient(username, password, token_cache)
 
+    if args.no_cache:
+        client.get_token(force_refresh=True)
+
+    # 3. 处理权限检测指令
+    if args.check_perms:
+        results = client.check_all_permissions(workers=max(1, args.jobs))
+        print_permission_table(results)
+        sys.exit(0)
+
+    # 4. 解析目标课程 post_id
+    if not args.url:
+        parser.print_help()
+        sys.exit(0)
+
     try:
-        if args.no_cache:
-            client.get_token(force_refresh=True)
-        print(f"[*] 正在获取课程页面 {post_id} 的视频信息...")
+        post_id = parse_post_id(args.url)
+    except Exception as e:
+        print(f"[!] 错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] 正在获取课程页面 {post_id} 的视频信息...")
+    try:
         post_data = client.fetch_post_videos(post_id)
     except PermissionError as e:
         print(f"[!] 权限不足: {e}", file=sys.stderr)
