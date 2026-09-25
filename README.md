@@ -23,7 +23,43 @@
 
 ## 🛠️ 环境准备
 
-- Python 3.7 或更高版本
+本项目需要 **Python 3.7+** 环境。若你的系统尚未安装 Python，请参考以下方式快速安装：
+
+### 1. Windows 系统
+
+- **官方下载**：[Python 3.8.6 64-bit 安装包](https://www.python.org/ftp/python/3.8.6/python-3.8.6.exe)
+- **国内加速**：[阿里云 Python 镜像源](https://mirrors.aliyun.com/python-release/windows/python-3.8.6.exe)
+
+> **安装教程**：
+> 1. 下载 `.exe` 安装程序并运行。
+> 2. **务必勾选安装界面底部的「Add Python 3.8 to PATH」**（将 Python 添加到系统环境变量）。
+> 3. 点击「Install Now」等待安装完成即可。
+
+### 2. Linux 系统
+
+根据你的发行版选择对应包管理命令安装：
+
+- **Ubuntu / Debian 系（apt）**：
+  ```bash
+  sudo apt update && sudo apt install -y python3
+  ```
+
+- **Arch Linux / Manjaro 系（pacman）**：
+  ```bash
+  sudo pacman -Syu --needed python
+  ```
+
+### 3. 验证安装
+
+打开终端或命令行（cmd / PowerShell），运行以下命令确认输出版本号即安装成功：
+
+```bash
+# Windows
+python --version
+
+# Linux / macOS
+python3 --version
+```
 
 ---
 
@@ -43,8 +79,6 @@ cp .env.example .env
 AITOP_USERNAME=15500000000
 AITOP_PASSWORD=your_password_here
 ```
-
-> **提示**：`.env` 已在 `.gitignore` 中配置，请勿将其提交到公共版本库。
 
 ---
 
