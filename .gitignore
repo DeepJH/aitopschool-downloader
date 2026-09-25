@@ -1,0 +1,9 @@
+.env
+*.token.json
+.aitop_token.json
+__pycache__/
+*.py[cod]
+downloads/
+Downloads/
+.vscode/
+.idea/
