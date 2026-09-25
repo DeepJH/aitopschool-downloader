@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-真术相成 (ai.aitopschool.com) 视频 CLI 下载器
+真术相成 (ai.aitopschool.com) 视频批量/单集 CLI 下载器
 纯 Python 标准库编写，零外部依赖，支持 Linux/macOS/Windows。
 """
 
@@ -32,6 +32,16 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+PRINT_LOCK = threading.Lock()
+
+
+def safe_log(msg: str, is_err: bool = False):
+    """线程安全的控制台日志输出，包含时间戳 (并发方案 A)"""
+    now_str = time.strftime("%H:%M:%S")
+    with PRINT_LOCK:
+        f = sys.stderr if is_err else sys.stdout
+        print(f"[{now_str}] {msg}", file=f, flush=True)
 
 
 def load_env(env_path: Path) -> dict:
@@ -79,7 +89,7 @@ def pad_string(s: str, target_width: int) -> str:
 
 def sanitize_filename(name: str) -> str:
     """清理文件名中跨平台非法字符"""
-    name = re.sub(r'[\\/*?:"<>|]', "_", name)
+    name = re.sub(r'[\/*?:"<>|]', "_", name)
     name = name.strip().strip(".")
     return name or "unnamed"
 
@@ -109,6 +119,61 @@ def encode_media_url(raw_url: str) -> str:
     return urllib.parse.urlunsplit(
         (parts.scheme, parts.netloc, quoted_path, parts.query, parts.fragment)
     )
+
+
+def verify_mp4_file(file_path: Path, expected_size: int = 0) -> tuple:
+    """
+    校验 MP4 文件完整性：
+    1. 若提供了 expected_size，检查文件大小与 Content-Length 是否完全匹配；
+    2. 优先调用系统 ffprobe 探测媒体流与时长有效性；
+    3. 若无 ffprobe，则校验 MP4 头部 ftyp 魔数与文件完整性。
+    """
+    if not file_path.is_file():
+        return False, "文件不存在"
+
+    actual_size = file_path.stat().st_size
+    if actual_size == 0:
+        return False, "文件为空 (0 字节)"
+
+    if expected_size > 0 and actual_size != expected_size:
+        return False, f"文件大小不符 (期望: {expected_size} 字节, 实际: {actual_size} 字节)"
+
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        try:
+            cmd = [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if res.returncode == 0:
+                duration_str = res.stdout.strip()
+                if duration_str:
+                    try:
+                        dur = float(duration_str)
+                        if dur > 0:
+                            return True, f"ffprobe 校验通过 (时长: {dur:.1f}s)"
+                    except ValueError:
+                        pass
+            err_msg = res.stderr.strip() or f"ffprobe 返回码 {res.returncode}"
+            return False, f"视频流损坏: {err_msg}"
+        except Exception:
+            pass
+
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(12)
+            if len(header) >= 8 and header[4:8] == b"ftyp":
+                return True, "MP4 文件头校验通过"
+            return False, "非有效 MP4 格式 (缺少 ftyp 魔数)"
+    except Exception as e:
+        return False, f"读取文件异常: {e}"
 
 
 class AitopClient:
@@ -213,7 +278,6 @@ class AitopClient:
                 result = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code == 401 or e.code == 403:
-                # Token 可能失效，重试一次刷新登录
                 print("[!] Token 已失效，正在重新登录...")
                 token = self.get_token(force_refresh=True)
                 req.headers["Authorization"] = f"Bearer {token}"
@@ -269,6 +333,70 @@ class AitopClient:
         ]
         return sorted(course_cats, key=lambda x: x["id"])
 
+    def fetch_category_posts(self, category_id: int) -> list:
+        """获取指定分类/期数下的所有课程文章列表（自动分页）"""
+        posts = []
+        page = 1
+        while True:
+            url = f"{POSTS_API}?categories={category_id}&per_page=100&page={page}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Referer": BASE_URL,
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if not data:
+                        break
+                    posts.extend(data)
+                    total_pages = int(resp.headers.get("X-WP-TotalPages", 1))
+                    if page >= total_pages:
+                        break
+                    page += 1
+            except urllib.error.HTTPError:
+                break
+            except Exception as e:
+                print(f"[!] 获取分类 {category_id} 文章列表异常: {e}", file=sys.stderr)
+                break
+        return posts
+
+    def find_category(self, query: str) -> dict:
+        """根据用户输入的名称、期数、ID 或链接匹配分类"""
+        categories = self.fetch_course_categories()
+        q_str = str(query).strip().rstrip("/")
+
+        if "aitopschool.com" in q_str:
+            for c in categories:
+                if c.get("link", "").rstrip("/") == q_str:
+                    return c
+            slug = q_str.split("/")[-1]
+            for c in categories:
+                if c.get("slug") == slug or urllib.parse.unquote(c.get("slug", "")) == urllib.parse.unquote(slug):
+                    return c
+
+        if q_str.isdigit():
+            num = int(q_str)
+            for c in categories:
+                name = c.get("name", "")
+                if name == f"{num}期" or name == f"{num}期课程":
+                    return c
+            for c in categories:
+                if c.get("id") == num:
+                    return c
+
+        for c in categories:
+            if q_str == c.get("name", ""):
+                return c
+
+        for c in categories:
+            if q_str in c.get("name", ""):
+                return c
+
+        return None
+
     def check_category_permission(self, category: dict) -> dict:
         """
         抽检分类下的第一篇课程，检查是否有权下载。
@@ -321,7 +449,7 @@ class AitopClient:
                     }
             except PermissionError as pe:
                 raw_msg = str(pe).split(": ")[-1] if ": " in str(pe) else str(pe)
-                clean_msg = re.sub(r'<[^>]+>', '', raw_msg).replace("['", "").replace("']", "").strip()
+                clean_msg = re.sub(r"<[^>]+>", "", raw_msg).replace("['", "").replace("']", "").strip()
                 return {
                     "category": category,
                     "has_perm": False,
@@ -337,7 +465,7 @@ class AitopClient:
                 "reason": f"请求异常: {e}",
             }
 
-    def check_all_permissions(self, workers: int = 4) -> list:
+    def check_all_permissions(self, workers: int = 8) -> list:
         """并发检测所有课程分类的下载权限"""
         categories = self.fetch_course_categories()
         self.get_token()
@@ -351,9 +479,18 @@ class AitopClient:
         return results
 
 
-def download_file(url: str, dest_path: Path, title: str):
+def download_single_video(
+    url: str,
+    dest_path: Path,
+    title: str,
+    index: int = 1,
+    total: int = 1,
+    quiet: bool = False,
+    max_retries: int = 3,
+) -> str:
     """
-    单文件断点续传流式下载，附带终端动态进度条显示
+    单文件断点续传流式下载与完整性校验。
+    返回状态: 'success' | 'skipped' | 'failed'
     """
     encoded_url = encode_media_url(url)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,107 +501,334 @@ def download_file(url: str, dest_path: Path, title: str):
         "Referer": BASE_URL,
     }
 
-    # 检查远程文件大小 (HEAD 或 Range: bytes=0-0)
-    total_size = 0
+    # 1. 探测远程文件大小
+    remote_size = 0
     head_req = urllib.request.Request(
         encoded_url, headers=dict(headers, Range="bytes=0-0")
     )
-    try:
-        with urllib.request.urlopen(head_req, timeout=15) as resp:
-            content_range = resp.headers.get("Content-Range")
-            if content_range and "/" in content_range:
-                total_size = int(content_range.split("/")[-1])
-            else:
-                cl = resp.headers.get("Content-Length")
-                if cl:
-                    total_size = int(cl)
-    except Exception:
-        pass
+    for _ in range(2):
+        try:
+            with urllib.request.urlopen(head_req, timeout=15) as resp:
+                content_range = resp.headers.get("Content-Range")
+                if content_range and "/" in content_range:
+                    remote_size = int(content_range.split("/")[-1])
+                else:
+                    cl = resp.headers.get("Content-Length")
+                    if cl:
+                        remote_size = int(cl)
+            break
+        except Exception:
+            time.sleep(0.5)
 
-    # 检查已下载的完整文件
-    if dest_path.exists() and total_size > 0:
-        if dest_path.stat().st_size == total_size:
-            print(f"  [√] 文件已存在且完整，跳过: {dest_path.name} ({format_bytes(total_size)})")
-            return
-        elif dest_path.stat().st_size > total_size:
-            dest_path.unlink()
+    # 2. 检查已下载的完整文件
+    if dest_path.is_file():
+        valid, reason = verify_mp4_file(dest_path, expected_size=remote_size)
+        if valid:
+            safe_log(
+                f"[√ 已存在] [{index}/{total}] {dest_path.name} "
+                f"({format_bytes(dest_path.stat().st_size)}) 完整性校验通过，跳过下载"
+            )
+            return "skipped"
+        else:
+            safe_log(
+                f"[!] [{index}/{total}] {dest_path.name} 存在但损坏 ({reason})，将重新下载"
+            )
+            dest_path.unlink(missing_ok=True)
 
+    # 3. 检查断点续传分片
     downloaded = 0
     if temp_path.exists():
         downloaded = temp_path.stat().st_size
-        if total_size > 0 and downloaded > total_size:
-            temp_path.unlink()
+        if remote_size > 0 and downloaded > remote_size:
+            temp_path.unlink(missing_ok=True)
             downloaded = 0
 
-    if downloaded > 0:
-        headers["Range"] = f"bytes={downloaded}-"
-        mode = "ab"
-        print(f"  [*] 发现未完成分片，断点续传: {format_bytes(downloaded)} / {format_bytes(total_size)}")
+    chunk_size = 128 * 1024
+    for attempt in range(1, max_retries + 1):
+        req_headers = dict(headers)
+        if downloaded > 0:
+            req_headers["Range"] = f"bytes={downloaded}-"
+            mode = "ab"
+            resume_msg = f" (续传: {format_bytes(downloaded)} / {format_bytes(remote_size)})"
+        else:
+            mode = "wb"
+            resume_msg = ""
+
+        if quiet:
+            safe_log(f"[开始下载] [{index}/{total}] {title} -> {dest_path.name}{resume_msg}")
+        else:
+            print(f"  [-] 开始下载: {dest_path.name}{resume_msg}")
+
+        start_time = time.time()
+        last_print = 0.0
+        bytes_in_session = 0
+
+        try:
+            req = urllib.request.Request(encoded_url, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=25) as resp, open(temp_path, mode) as out_f:
+                if downloaded == 0 and remote_size == 0:
+                    cl = resp.headers.get("Content-Length")
+                    if cl:
+                        remote_size = int(cl)
+
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+                    downloaded += len(chunk)
+                    bytes_in_session += len(chunk)
+
+                    if not quiet:
+                        now = time.time()
+                        if now - last_print >= 0.25:
+                            elapsed = max(now - start_time, 0.001)
+                            speed = bytes_in_session / elapsed
+                            if remote_size > 0:
+                                pct = (downloaded / remote_size) * 100.0
+                                eta = (remote_size - downloaded) / max(speed, 1.0)
+                                eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
+                                bar_len = 25
+                                filled = int(bar_len * downloaded // remote_size)
+                                bar = "=" * filled + (">" if filled < bar_len else "") + " " * (bar_len - filled - 1)
+                                sys.stdout.write(
+                                    f"\r  [{bar}] {pct:5.1f}% | "
+                                    f"{format_bytes(downloaded)}/{format_bytes(remote_size)} | "
+                                    f"{format_bytes(speed)}/s | ETA: {eta_str}"
+                                )
+                            else:
+                                sys.stdout.write(
+                                    f"\r  [下载中] {format_bytes(downloaded)} | {format_bytes(speed)}/s"
+                                )
+                            sys.stdout.flush()
+                            last_print = now
+
+            if not quiet:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
+            # 下载完成后替换正式文件名
+            if temp_path.exists():
+                temp_path.replace(dest_path)
+
+            # 4. 执行文件完整性校验
+            valid, reason = verify_mp4_file(dest_path, expected_size=remote_size)
+            if not valid:
+                dest_path.unlink(missing_ok=True)
+                raise RuntimeError(f"文件完整性校验不通过: {reason}")
+
+            total_elapsed = max(time.time() - start_time, 0.001)
+            avg_speed = (bytes_in_session / total_elapsed) if bytes_in_session else 0
+            safe_log(
+                f"[√ 校验通过] [{index}/{total}] {dest_path.name} | "
+                f"共 {format_bytes(downloaded)} | 耗时 {total_elapsed:.1f}s ({format_bytes(avg_speed)}/s) | {reason}"
+            )
+            return "success"
+
+        except Exception as e:
+            if not quiet:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            if attempt < max_retries:
+                safe_log(
+                    f"[!] [{index}/{total}] {dest_path.name} 网络波动 ({e})，正在第 {attempt}/{max_retries} 次重试..."
+                )
+                time.sleep(1.5)
+                if temp_path.exists():
+                    downloaded = temp_path.stat().st_size
+            else:
+                safe_log(f"[x 失败] [{index}/{total}] {dest_path.name} 下载失败: {e}", is_err=True)
+                return "failed"
+
+
+def run_download_batch(tasks: list, workers: int = 8) -> tuple:
+    """
+    并发批量下载任务清单。
+    返回 (成功数, 跳过数, 失败数)
+    """
+    total = len(tasks)
+    if total == 0:
+        print("[!] 没有可下载的视频任务。")
+        return 0, 0, 0
+
+    workers = max(1, workers)
+    single_bar_mode = (workers == 1 and total == 1)
+
+    completed_lock = threading.Lock()
+    stats = {"success": 0, "skipped": 0, "failed": 0}
+
+    def worker_func(idx, task):
+        url = task["url"]
+        dest = task["dest_path"]
+        title = task["title"]
+
+        try:
+            status = download_single_video(
+                url=url,
+                dest_path=dest,
+                title=title,
+                index=idx,
+                total=total,
+                quiet=not single_bar_mode,
+            )
+            with completed_lock:
+                if status == "success":
+                    stats["success"] += 1
+                elif status == "skipped":
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
+        except Exception as e:
+            with completed_lock:
+                stats["failed"] += 1
+            safe_log(f"[x 异常] [{idx}/{total}] {title}: {e}", is_err=True)
+
+    if workers == 1:
+        for idx, task in enumerate(tasks, 1):
+            worker_func(idx, task)
     else:
-        mode = "wb"
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(worker_func, idx, t) for idx, t in enumerate(tasks, 1)]
+            for f in futures:
+                f.result()
 
-    req = urllib.request.Request(encoded_url, headers=headers)
-    chunk_size = 128 * 1024  # 128KB 缓冲区
-    start_time = time.time()
-    last_print = 0.0
+    return stats["success"], stats["skipped"], stats["failed"]
 
-    print(f"  [-] 开始下载: {dest_path.name}")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp, open(temp_path, mode) as out_f:
-            if downloaded == 0 and total_size == 0:
-                cl = resp.headers.get("Content-Length")
-                if cl:
-                    total_size = int(cl)
 
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                out_f.write(chunk)
-                downloaded += len(chunk)
+def download_term(
+    client: AitopClient,
+    term_query: str,
+    download_dir: Path,
+    workers: int = 8,
+    limit: int = None,
+) -> tuple:
+    """
+    下载指定期数/分类下的全部课程视频。
+    目录结构: <download_dir>/<期数名称>/<课程标题>/<序号_分集标题>.mp4
+    """
+    cat = client.find_category(term_query)
+    if not cat:
+        print(f"[!] 错误: 未找到与 '{term_query}' 匹配的期数或分类！", file=sys.stderr)
+        sys.exit(1)
 
-                now = time.time()
-                if now - last_print >= 0.2:
-                    elapsed = max(now - start_time, 0.001)
-                    speed = (downloaded - (temp_path.stat().st_size if mode == 'ab' else 0)) / elapsed if mode != 'ab' else downloaded / elapsed
-                    # 简化平均速率
-                    speed = downloaded / elapsed
+    cat_name = cat.get("name", f"cat_{cat['id']}")
+    print(f"\n[*] 正在准备期数/分类: {cat_name} (分类ID: {cat['id']})")
 
-                    if total_size > 0:
-                        pct = (downloaded / total_size) * 100.0
-                        eta = (total_size - downloaded) / max(speed, 1.0)
-                        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta))
-                        bar_len = 25
-                        filled = int(bar_len * downloaded // total_size)
-                        bar = "=" * filled + (">" if filled < bar_len else "") + " " * (bar_len - filled - 1)
-                        progress_text = (
-                            f"\r  [{bar}] {pct:5.1f}% | "
-                            f"{format_bytes(downloaded)}/{format_bytes(total_size)} | "
-                            f"{format_bytes(speed)}/s | ETA: {eta_str}"
-                        )
-                    else:
-                        progress_text = (
-                            f"\r  [下载中] {format_bytes(downloaded)} | {format_bytes(speed)}/s"
-                        )
-
-                    sys.stdout.write(progress_text)
-                    sys.stdout.flush()
-                    last_print = now
-
-        # 完成后重命名
-        if temp_path.exists():
-            temp_path.replace(dest_path)
-
-        total_elapsed = max(time.time() - start_time, 0.001)
-        avg_speed = downloaded / total_elapsed
-        sys.stdout.write(
-            f"\r  [√] 完成: {dest_path.name} | 共 {format_bytes(downloaded)} | 耗时 {total_elapsed:.1f}s ({format_bytes(avg_speed)}/s)\n"
+    chk = client.check_category_permission(cat)
+    if not chk.get("has_perm"):
+        print(
+            f"[!] 权限不足: 当前账号无权下载分类 [{cat_name}] ({chk.get('reason')})",
+            file=sys.stderr,
         )
-        sys.stdout.flush()
+        sys.exit(1)
 
-    except Exception as e:
-        sys.stdout.write("\n")
-        raise RuntimeError(f"下载中断: {dest_path.name}: {e}")
+    print(f"[*] 正在获取 [{cat_name}] 下的所有课程清单...")
+    posts = client.fetch_category_posts(cat["id"])
+    if not posts:
+        print(f"[!] 分类 [{cat_name}] 下未找到任何课程文章。", file=sys.stderr)
+        return 0, 0, 0
+
+    if limit and limit > 0:
+        posts = posts[:limit]
+        print(f"[*] 已限制仅处理前 {limit} 篇课程 (共 {cat.get('count', len(posts))} 篇)")
+    else:
+        print(f"[*] 共获取到 {len(posts)} 篇课程文章，正在以 {workers} 线程并发解析视频链接...")
+
+    post_videos_map = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        def fetch_pv(p):
+            pid = p["id"]
+            raw_title = p.get("title", {}).get("rendered", f"course_{pid}")
+            for attempt in range(1, 4):
+                try:
+                    vdata = client.fetch_post_videos(str(pid))
+                    return pid, raw_title, vdata.get("videos") or []
+                except Exception as e:
+                    if attempt == 3:
+                        print(f"[!] 解析课程 {pid} 视频信息失败: {e}", file=sys.stderr)
+                    time.sleep(1)
+            return pid, raw_title, []
+
+        futures = [executor.submit(fetch_pv, p) for p in posts]
+        for f in futures:
+            pid, raw_title, vids = f.result()
+            if vids:
+                post_videos_map[pid] = (raw_title, vids)
+
+    tasks = []
+    term_dir = download_dir / sanitize_filename(cat_name)
+
+    for pid, (raw_course_title, videos) in post_videos_map.items():
+        course_dir = term_dir / sanitize_filename(raw_course_title)
+        for ep_idx, item in enumerate(videos, 1):
+            video_url = item.get("url")
+            if not video_url:
+                continue
+            raw_ep_title = item.get("title") or f"episode_{ep_idx}"
+            sanitized_ep = sanitize_filename(raw_ep_title)
+            if re.match(r"^\d+", sanitized_ep):
+                filename = f"{sanitized_ep}.mp4"
+            else:
+                filename = f"{ep_idx:02d}_{sanitized_ep}.mp4"
+
+            tasks.append({
+                "url": video_url,
+                "dest_path": course_dir / filename,
+                "title": f"{raw_course_title} - {raw_ep_title}",
+            })
+
+    print(f"[*] 解析完毕: 共提取到 {len(tasks)} 个有效视频下载任务")
+    print(f"[*] 文件保存根目录: {term_dir.resolve()}")
+
+    success, skipped, failed = run_download_batch(tasks, workers=workers)
+
+    print("\n" + "=" * 60)
+    print(f"期数 [{cat_name}] 处理完毕！")
+    print(f"统计: 成功 {success} 个 | 跳过已完成 {skipped} 个 | 失败 {failed} 个")
+    print(f"保存目录: {term_dir.resolve()}")
+    print("=" * 60 + "\n")
+    return success, skipped, failed
+
+
+def download_all_allowed(
+    client: AitopClient,
+    download_dir: Path,
+    workers: int = 8,
+    limit: int = None,
+):
+    """检测账号所有有权限的期数，并批量下载全部课程"""
+    print("\n[*] 正在启动全站期数权限检测...")
+    results = client.check_all_permissions(workers=workers)
+    allowed_categories = [r["category"] for r in results if r.get("has_perm")]
+
+    if not allowed_categories:
+        print("[!] 检测完成，但当前账号没有发现任何有下载权限的课程分类！", file=sys.stderr)
+        return
+
+    print(f"\n[+] 权限检测完成！共发现 {len(allowed_categories)} 个有权限的分类:")
+    for c in allowed_categories:
+        print(f"  * {c.get('name')} (ID: {c.get('id')}, 共 {c.get('count')} 篇课程)")
+
+    print(f"\n[*] 即将开始下载上述所有有权限分类的课程...")
+    total_s, total_sk, total_f = 0, 0, 0
+    for idx, cat in enumerate(allowed_categories, 1):
+        print(f"\n>>> [{idx}/{len(allowed_categories)}] 正在下载期数: {cat.get('name')} <<<")
+        s, sk, f = download_term(
+            client=client,
+            term_query=str(cat["id"]),
+            download_dir=download_dir,
+            workers=workers,
+            limit=limit,
+        )
+        total_s += s
+        total_sk += sk
+        total_f += f
+
+    print("\n" + "=" * 60)
+    print("[+] 全量下载任务结束！")
+    print(f"总计: 成功 {total_s} 个 | 跳过 {total_sk} 个 | 失败 {total_f} 个")
+    print(f"保存根目录: {download_dir.resolve()}")
+    print("=" * 60 + "\n")
 
 
 def print_permission_table(results: list) -> list:
@@ -523,16 +887,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 检测账号对所有期数/课程分类的下载权限:
+  # 1. 自动检测账号有哪些期数的课程有权下载:
   python3 aitop_downloader.py --check-perms
 
-  # 下载指定课程页面的全部视频到默认系统下载目录:
+  # 2. 下载指定期数/分类下的全部课程 (以 45 期为例，默认 8 线程并发下载):
+  python3 aitop_downloader.py -t 45
+  python3 aitop_downloader.py -t 45期 -d /path/to/save
+  python3 aitop_downloader.py -t https://ai.aitopschool.com/xsz/45qi -j 8
+
+  # 3. 自动检测所有有权限的期数并下载全部:
+  python3 aitop_downloader.py --all
+  python3 aitop_downloader.py --all -j 8
+
+  # 4. 下载指定单个课程页面的全部视频 (默认并发下载):
   python3 aitop_downloader.py https://ai.aitopschool.com/21667
 
-  # 指定自定义下载保存目录:
-  python3 aitop_downloader.py 21667 -d /path/to/my_videos
-
-  # 仅下载该页面的第 1 集视频:
+  # 5. 仅下载单个课程页面的第 1 集视频:
   python3 aitop_downloader.py 21599 -e 1
         """,
     )
@@ -549,11 +919,28 @@ def main():
         help="自动检测账号对各个期数/分类课程的下载权限并打印列表",
     )
     parser.add_argument(
+        "-t",
+        "--term",
+        default=None,
+        help="下载指定期数/分类下的全部课程 (例如: 45, 45期, 预习课程 或 期数分类网址)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="自动检测账号有权限的全部期数，并批量下载所有课程",
+    )
+    parser.add_argument(
         "-j",
         "--jobs",
         type=int,
         default=8,
         help="并发下载/检测线程数 (默认: 8)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="限制处理的课程数量 (用于小批量试跑测试，避免硬盘空间不足)",
     )
     parser.add_argument(
         "-d",
@@ -616,7 +1003,28 @@ def main():
         print_permission_table(results)
         sys.exit(0)
 
-    # 4. 解析目标课程 post_id
+    # 4. 处理全量有权限期数批量下载
+    if args.all:
+        download_all_allowed(
+            client=client,
+            download_dir=Path(args.download_directory),
+            workers=max(1, args.jobs),
+            limit=args.limit,
+        )
+        sys.exit(0)
+
+    # 5. 处理单期批量下载
+    if args.term:
+        download_term(
+            client=client,
+            term_query=args.term,
+            download_dir=Path(args.download_directory),
+            workers=max(1, args.jobs),
+            limit=args.limit,
+        )
+        sys.exit(0)
+
+    # 6. 处理单课程下载
     if not args.url:
         parser.print_help()
         sys.exit(0)
@@ -651,7 +1059,6 @@ def main():
     print(f"保存目录: {Path(args.download_directory) / course_title}")
     print(f"==================================================")
 
-    # 4. 筛选分集
     target_items = []
     if args.episode is not None:
         if args.episode < 1 or args.episode > len(videos):
@@ -664,18 +1071,14 @@ def main():
     else:
         target_items = [(idx + 1, item) for idx, item in enumerate(videos)]
 
-    # 5. 执行下载循环
     dest_dir = Path(args.download_directory) / course_title
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    success_count = 0
-    fail_count = 0
-
+    tasks = []
     for ep_num, item in target_items:
         raw_title = item.get("title") or f"episode_{ep_num}"
         sanitized_sub = sanitize_filename(raw_title)
 
-        # 若原标题未包含数字前缀，添加序号以保持排序整齐
         if re.match(r"^\d+", sanitized_sub):
             filename = f"{sanitized_sub}.mp4"
         else:
@@ -683,26 +1086,23 @@ def main():
 
         video_url = item.get("url")
         if not video_url:
-            print(f"\n[!] 第 {ep_num} 节 [{raw_title}] 未找到视频下载链接，跳过。")
-            fail_count += 1
+            print(f"[!] 第 {ep_num} 节 [{raw_title}] 未找到视频下载链接，跳过。")
             continue
 
-        target_file = dest_dir / filename
-        print(f"\n[{ep_num}/{len(videos)}] 正在处理: {raw_title}")
-        try:
-            download_file(video_url, target_file, raw_title)
-            success_count += 1
-        except KeyboardInterrupt:
-            print("\n[!] 用户中断下载。")
-            sys.exit(130)
-        except Exception as e:
-            print(f"  [x] 下载失败: {e}", file=sys.stderr)
-            fail_count += 1
+        tasks.append({
+            "url": video_url,
+            "dest_path": dest_dir / filename,
+            "title": f"第{ep_num}节 {raw_title}",
+        })
+
+    success_count, skipped_count, fail_count = run_download_batch(
+        tasks, workers=max(1, args.jobs)
+    )
 
     print(f"\n==================================================")
-    print(f"下载任务完成！成功: {success_count} 个，失败: {fail_count} 个")
+    print(f"下载任务完成！成功: {success_count} 个，跳过: {skipped_count} 个，失败: {fail_count} 个")
     print(f"文件保存于: {dest_dir.resolve()}")
-    print(f"==================================================")
+    print(f"==================================================\n")
 
 
 if __name__ == "__main__":
